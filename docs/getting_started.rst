@@ -118,6 +118,23 @@ follows:
    ``node3`` is added back into the hasher and will be retried for any future
    operations.
 
+CAS values returned by ``gets`` are only meaningful on the node that produced
+them. When the cluster topology changes, re-hashing a key can send a raw CAS
+value to a different node. Use ``gets_with_token`` and ``cas_with_token`` for
+operations that need to retain their routing after a topology change:
+
+.. code-block:: python
+
+    value, token = client.gets_with_token(b"key")
+    client.cas_with_token(b"key", b"new-value", token)
+
+A token is bound to both its key and the node that issued it. It remains valid
+when that node temporarily leaves the pool and later returns. A token is
+rejected if its key changes, if its node has been permanently removed, or if
+the node address has been replaced by a different server instance. The legacy
+``gets`` and ``cas`` methods continue accepting raw CAS values, which remain
+re-hashed by key.
+
 Using the built-in retrying mechanism
 -------------------------------------
 The library comes with retry mechanisms that can be used to wrap all kinds of

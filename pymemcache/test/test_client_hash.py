@@ -1,6 +1,10 @@
-from pymemcache.client.hash import HashClient
+from pymemcache.client.hash import CASToken, HashClient
 from pymemcache.client.base import Client, PooledClient
-from pymemcache.exceptions import MemcacheError, MemcacheUnknownError
+from pymemcache.exceptions import (
+    MemcacheClientError,
+    MemcacheError,
+    MemcacheUnknownError,
+)
 from pymemcache import pool
 
 from .test_client import ClientTestMixin, MockSocket
@@ -9,6 +13,29 @@ import os
 import pytest
 from unittest import mock
 import socket
+
+
+class FakeCASClient:
+    def __init__(self, server, **kwargs):
+        self.server = server
+        self.gets_calls = []
+        self.cas_calls = []
+        self.closed = False
+
+    def gets(self, key, default=None, cas_default=None, **kwargs):
+        self.gets_calls.append(key)
+        return b"value", b"42"
+
+    def cas(self, key, value, cas, **kwargs):
+        self.cas_calls.append((key, value, cas))
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+class PooledHashClient(HashClient):
+    client_class = FakeCASClient
 
 
 class TestHashClient(ClientTestMixin, unittest.TestCase):
@@ -251,6 +278,135 @@ class TestHashClient(ClientTestMixin, unittest.TestCase):
         assert client.set(b"key3", b"value2", noreply=False) is True
         result = client.gets_many([b"key1", b"key3"])
         assert result == {b"key1": (b"value1", b"1"), b"key3": (b"value2", b"1")}
+
+    def test_cas_token_is_route_bound(self):
+        ip = "127.0.0.1"
+        server_a = (ip, 11011)
+        server_b = (ip, 11012)
+        server_c = (ip, 11013)
+        key_a = b"key_a"
+        key_b = b"key_b"
+
+        client = PooledHashClient([], use_pooling=True)
+        client.add_server(server_a)
+        client.add_server(server_b)
+
+        node_a = "127.0.0.1:11011"
+        node_b = "127.0.0.1:11012"
+        node_c = "127.0.0.1:11013"
+        routing = {key_a: node_a, key_b: node_b}
+        client.hasher.get_node = lambda key: routing[key]
+
+        value_a, token_a = client.gets_with_token(key_a)
+        value_b, token_b = client.gets_with_token(key_b)
+
+        assert value_a == value_b == b"value"
+        assert token_a.cas == token_b.cas == b"42"
+        assert token_a.server_key == node_a
+        assert token_b.server_key == node_b
+
+        client.add_server(server_c)
+        routing[key_a] = node_c
+        routing[key_b] = node_c
+
+        fake_a = client.clients[node_a].client_pool.free[0]
+        fake_b = client.clients[node_b].client_pool.free[0]
+
+        assert client.cas(key_a, b"raw", b"42", noreply=False) is True
+        fake_c = client.clients[node_c].client_pool.free[0]
+        assert fake_c.cas_calls == [(key_a, b"raw", b"42")]
+
+        assert client.cas_with_token(key_a, b"from-a", token_a) is True
+        assert client.cas(key_b, b"from-b", token_b) is True
+        assert client.cas(key_b, b"from-b-kw", cas=token_b) is True
+
+        tuple_key = (b"server_key", b"tuple_item")
+        routing[b"server_key"] = node_b
+        _, tuple_token = client.gets_with_token(tuple_key)
+        routing[b"server_key"] = node_c
+        assert client.cas_with_token(tuple_key, b"tuple", tuple_token) is True
+
+        assert fake_a.cas_calls == [(key_a, b"from-a", b"42")]
+        assert fake_b.cas_calls == [
+            (key_b, b"from-b", b"42"),
+            (key_b, b"from-b-kw", b"42"),
+            (b"tuple_item", b"tuple", b"42"),
+        ]
+        assert client.clients[node_a].client_pool.used == ()
+
+        before_wrong_key = len(fake_b.cas_calls)
+        with pytest.raises(MemcacheClientError, match="different key"):
+            client.cas_with_token(b"other", b"ignored", token_b)
+        assert len(fake_b.cas_calls) == before_wrong_key
+
+        with pytest.raises(TypeError):
+            client.cas_with_token(key_a, b"ignored", node_a)
+
+        forged_token = CASToken(
+            token_b.client_id,
+            token_b.key,
+            node_a,
+            token_b.generation,
+            token_b.cas,
+            token_b.signature,
+        )
+        with pytest.raises(MemcacheClientError, match="invalid"):
+            client.cas_with_token(key_b, b"ignored", forged_token)
+        with pytest.raises(AttributeError):
+            token_b.server_key = node_a
+
+        other_client = PooledHashClient([], use_pooling=True)
+        other_client.add_server(server_a)
+        _, foreign_token = other_client.gets_with_token(key_a)
+        with pytest.raises(MemcacheClientError, match="different client"):
+            client.cas_with_token(key_a, b"ignored", foreign_token)
+
+        client.remove_server(server_a, permanent=True)
+        with pytest.raises(MemcacheClientError, match="permanently removed"):
+            client.cas_with_token(key_a, b"ignored", token_a)
+        assert fake_a.closed is True
+        assert fake_a.cas_calls == [(key_a, b"from-a", b"42")]
+
+        client.add_server(server_a)
+        with pytest.raises(MemcacheClientError, match="replaced"):
+            client.cas_with_token(key_a, b"ignored", token_a)
+
+        assert client.clients[node_b].client_pool.used == ()
+        assert len(client.clients[node_b].client_pool.free) == 1
+        assert client.clients[node_c].client_pool.used == ()
+        assert len(client.clients[node_c].client_pool.free) == 1
+
+    def test_cas_token_survives_temporary_server_recovery(self):
+        ip = "127.0.0.1"
+        server_a = (ip, 11021)
+        server_b = (ip, 11022)
+        key = b"key"
+        client = PooledHashClient([], use_pooling=True, dead_timeout=60)
+        client.add_server(server_a)
+        client.add_server(server_b)
+
+        node_a = "127.0.0.1:11021"
+        node_b = "127.0.0.1:11022"
+        client.hasher.get_node = lambda value: node_a if value == key else node_b
+
+        _, token = client.gets_with_token(key)
+        generation = token.generation
+        fake_a = client.clients[node_a].client_pool.free[0]
+
+        client.remove_server(server_a, permanent=False)
+        assert node_a in client.clients
+        assert node_a not in client.hasher.nodes
+        with pytest.raises(MemcacheClientError, match="temporarily unavailable"):
+            client.cas_with_token(key, b"too-soon", token)
+        assert fake_a.cas_calls == []
+        client._dead_clients[server_a] = -1
+        client._last_dead_check_time = -100
+
+        assert client.cas_with_token(key, b"recovered", token) is True
+        assert token.generation == generation
+        assert fake_a.cas_calls == [(key, b"recovered", b"42")]
+        assert node_a in client.hasher.nodes
+        assert client.clients[node_a].client_pool.used == ()
 
     def test_touch_not_found(self):
         client = self.make_client([b"NOT_FOUND\r\n"])

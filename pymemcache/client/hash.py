@@ -1,4 +1,8 @@
 import collections
+import hashlib
+import hmac
+import itertools
+import secrets
 import socket
 import time
 import logging
@@ -11,8 +15,59 @@ from pymemcache.client.base import (
 )
 from pymemcache.client.rendezvous import RendezvousHash
 from pymemcache.exceptions import MemcacheError
+from pymemcache.exceptions import MemcacheClientError
 
 logger = logging.getLogger(__name__)
+_client_identities = itertools.count(1)
+_missing_cas = object()
+
+
+class CASToken:
+    """
+    An opaque CAS value bound to the key and node that produced it.
+
+    Token objects are created by HashClient and must not be constructed by
+    application code. They contain routing metadata, but that metadata is not
+    trusted when a token is supplied to a different HashClient.
+    """
+
+    __slots__ = (
+        "_frozen",
+        "client_id",
+        "key",
+        "server_key",
+        "generation",
+        "cas",
+        "signature",
+    )
+
+    def __init__(
+        self, client_id, key, server_key, generation, cas, signature
+    ):
+        self._frozen = False
+        self.client_id = client_id
+        self.key = key
+        self.server_key = server_key
+        self.generation = generation
+        self.cas = cas
+        self.signature = signature
+        self._frozen = True
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_frozen", False):
+            raise AttributeError("CASToken is immutable")
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        if getattr(self, "_frozen", False):
+            raise AttributeError("CASToken is immutable")
+        super().__delattr__(name)
+
+    def __repr__(self):
+        return f"<{type(self).__name__}>"
+
+
+CasToken = CASToken
 
 
 class HashClient:
@@ -22,6 +77,20 @@ class HashClient:
 
     #: :class:`Client` class used to create new clients
     client_class = Client
+    _client_id = None
+    _generation_values = None
+    _node_generations = None
+    _token_secret = None
+
+    def _ensure_routing_state(self):
+        if self._client_id is None:
+            self._client_id = next(_client_identities)
+        if self._generation_values is None:
+            self._generation_values = itertools.count(1)
+        if self._node_generations is None:
+            self._node_generations = {}
+        if self._token_secret is None:
+            self._token_secret = secrets.token_bytes(32)
 
     def __init__(
         self,
@@ -75,6 +144,7 @@ class HashClient:
         constructor.
         """
         self.clients = {}
+        self._ensure_routing_state()
         self.retry_attempts = retry_attempts
         self.retry_timeout = retry_timeout
         self.dead_timeout = dead_timeout
@@ -123,24 +193,78 @@ class HashClient:
             return "%s:%s" % server
         return server
 
+    def _new_generation(self, key):
+        self._ensure_routing_state()
+        generation = next(self._generation_values)
+        self._node_generations[key] = generation
+        return generation
+
+    def _token_signature(self, token):
+        message = hmac.new(self._token_secret, digestmod=hashlib.sha256)
+
+        def update(value):
+            if isinstance(value, bytes):
+                message.update(value)
+            else:
+                message.update(str(value).encode("utf-8"))
+            message.update(b"\0")
+
+        update(token.client_id)
+        update(token.key)
+        update(token.server_key)
+        update(token.generation)
+        update(repr(token.cas))
+        return message.digest()
+
     def add_server(self, server, port=None) -> None:
+        """Add a server to the hash ring and create a new server generation."""
         # To maintain backward compatibility, if a port is provided, assume
         # that server wasn't provided as a (host, port) tuple.
         if port is not None:
             if not isinstance(server, str):
                 raise TypeError("Server must be a string when passing port.")
             server = (server, port)
+        server = normalize_server_spec(server)
+        self._dead_clients.pop(server, None)
+        self._failed_clients.pop(server, None)
 
+        key = self._make_client_key(server)
         _class = PooledClient if self.use_pooling else self.client_class
         client = _class(server, **self.default_kwargs)
         if self.use_pooling:
             client.client_class = self.client_class
 
-        key = self._make_client_key(server)
+        old_client = self.clients.pop(key, None)
+        if old_client is not None:
+            self._safely_run_func(old_client, old_client.close, False)
+
         self.clients[key] = client
+        self._new_generation(key)
         self.hasher.add_node(key)
 
-    def remove_server(self, server, port=None) -> None:
+    def _remove_server_temporarily(self, server):
+        key = self._make_client_key(server)
+        try:
+            self.hasher.remove_node(key)
+        except ValueError:
+            pass
+
+    def _remove_server_permanently(self, server):
+        key = self._make_client_key(server)
+        client = self.clients.pop(key, None)
+        if client is not None:
+            self._safely_run_func(client, client.close, False)
+        self._new_generation(key)
+        self._remove_server_temporarily(server)
+
+    def remove_server(self, server, port=None, permanent=False) -> None:
+        """
+        Remove a server from the hash ring.
+
+        A temporary removal keeps the client and its node identity for use when
+        ``dead_timeout`` expires. A permanent removal closes the client and
+        invalidates CAS tokens issued by that node.
+        """
         # To maintain backward compatibility, if a port is provided, assume
         # that server wasn't provided as a (host, port) tuple.
         if port is not None:
@@ -148,11 +272,19 @@ class HashClient:
                 raise TypeError("Server must be a string when passing port.")
             server = (server, port)
 
+        server = normalize_server_spec(server)
+        self._failed_clients.pop(server, None)
+
+        if permanent:
+            self._dead_clients.pop(server, None)
+            self._remove_server_permanently(server)
+        else:
+            self._dead_clients[server] = time.time()
+            self._remove_server_temporarily(server)
+
+    def _restore_server(self, server):
         key = self._make_client_key(server)
-        dead_time = time.time()
-        self._failed_clients.pop(server)
-        self._dead_clients[server] = dead_time
-        self.hasher.remove_node(key)
+        self.hasher.add_node(key)
 
     def _retry_dead(self) -> None:
         current_time = time.time()
@@ -165,7 +297,7 @@ class HashClient:
                     candidates.append(server)
             for server in candidates:
                 logger.debug("bringing server back into rotation %s", server)
-                self.add_server(server)
+                self._restore_server(server)
                 del self._dead_clients[server]
             self._last_dead_check_time = current_time
 
@@ -212,7 +344,7 @@ class HashClient:
                     # We've reached our max retry attempts, we need to mark
                     # the sever as dead
                     logger.debug("marking server as dead: %s", client.server)
-                    self.remove_server(client.server)
+                    self.remove_server(client.server, permanent=False)
 
             result = func(*args, **kwargs)
             return result
@@ -265,7 +397,7 @@ class HashClient:
                     # We've reached our max retry attempts, we need to mark
                     # the sever as dead
                     logger.debug("marking server as dead: %s", client.server)
-                    self.remove_server(client.server)
+                    self.remove_server(client.server, permanent=False)
 
             succeeded, failed, err = self._set_many(client, values, *args, **kwargs)
             if err is not None:
@@ -307,7 +439,7 @@ class HashClient:
                 "attempts": 0,
             }
             logger.debug("marking server as dead %s", server)
-            self.remove_server(server)
+            self.remove_server(server, permanent=False)
         # This client has failed previously, we need to update the metadata
         # to reflect that we have attempted it again
         else:
@@ -326,6 +458,47 @@ class HashClient:
         args = list(args)
         args.insert(0, key)
         return self._safely_run_func(client, func, default_val, *args, **kwargs)
+
+    def _split_key(self, key):
+        if isinstance(key, tuple) and len(key) == 2:
+            return key[1], key[0]
+        return key, key
+
+    def _get_token_client(self, key, token, retry=True):
+        self._ensure_routing_state()
+        if not isinstance(token, CASToken):
+            raise TypeError("cas token must be a CASToken instance")
+        if token.client_id != self._client_id:
+            raise MemcacheClientError("CAS token was issued by a different client")
+        if not hmac.compare_digest(
+            token.signature, self._token_signature(token)
+        ):
+            raise MemcacheClientError("CAS token is invalid")
+
+        item_key, server_key = self._split_key(key)
+        if token.key != item_key:
+            raise MemcacheClientError("CAS token is bound to a different key")
+
+        server_key_name = token.server_key
+        if retry and self._dead_clients:
+            self._retry_dead()
+
+        temporary_server = any(
+            self._make_client_key(server) == server_key_name
+            for server in self._dead_clients
+        )
+        if temporary_server:
+            raise MemcacheClientError("CAS token's server is temporarily unavailable")
+
+        if server_key_name not in self.clients:
+            raise MemcacheClientError(
+                "CAS token's server has been permanently removed"
+            )
+        if self._node_generations.get(server_key_name) != token.generation:
+            raise MemcacheClientError("CAS token's server has been replaced")
+
+        check_key_helper(server_key, self.allow_unicode_keys, self.key_prefix)
+        return self.clients[server_key_name], item_key
 
     def _set_many(self, client, values, *args, **kwargs):
         failed = []
@@ -417,6 +590,52 @@ class HashClient:
     def gets(self, key, *args, **kwargs):
         return self._run_cmd("gets", key, None, *args, **kwargs)
 
+    def gets_with_token(
+        self, key, default=None, cas_default=_missing_cas, **kwargs
+    ):
+        """
+        Fetch a key and return an opaque, route-bound CAS token on a hit.
+        """
+        client, item_key = self._get_client(key)
+        effective_cas_default = (
+            None if cas_default is _missing_cas else cas_default
+        )
+        if client is None:
+            return default, effective_cas_default
+
+        underlying_cas_default = object()
+        defaults = (default, underlying_cas_default)
+        result = self._safely_run_func(
+            client,
+            client.gets,
+            defaults,
+            item_key,
+            default=default,
+            cas_default=underlying_cas_default,
+            **kwargs,
+        )
+        if result is defaults:
+            return default, effective_cas_default
+        value, cas = result
+        if cas is underlying_cas_default:
+            return default, effective_cas_default
+
+        _, server_key = self._split_key(key)
+        server_key_name = self._make_client_key(client.server)
+        token = CASToken.__new__(CASToken)
+        token._frozen = False
+        token.client_id = self._client_id
+        token.key = item_key
+        token.server_key = server_key_name
+        token.generation = self._node_generations[server_key_name]
+        token.cas = cas
+        token.signature = self._token_signature(token)
+        token._frozen = True
+        return value, token
+
+    gets_token = gets_with_token
+    get_cas_token = gets_with_token
+
     def gets_many(self, keys, *args, **kwargs):
         return self.get_many(keys, gets=True, *args, **kwargs)
 
@@ -442,7 +661,37 @@ class HashClient:
     delete_multi = delete_many
 
     def cas(self, key, *args, **kwargs):
+        """
+        Perform a raw CAS update, or update by token when given a CASToken.
+        """
+        token = args[1] if len(args) > 1 else kwargs.get("cas")
+        if isinstance(token, CASToken):
+            if len(args) > 1:
+                return self.cas_with_token(
+                    key, args[0], token, *args[2:], **kwargs
+                )
+            value = args[0]
+            kwargs.pop("cas")
+            return self.cas_with_token(key, value, token, **kwargs)
         return self._run_cmd("cas", key, False, *args, **kwargs)
+
+    def cas_with_token(self, key, value, token, *args, **kwargs):
+        """
+        Perform a CAS update using only the node and key bound to ``token``.
+        """
+        client, item_key = self._get_token_client(key, token)
+        return self._safely_run_func(
+            client,
+            client.cas,
+            False,
+            item_key,
+            value,
+            token.cas,
+            *args,
+            **kwargs,
+        )
+
+    cas_token = cas_with_token
 
     def replace(self, key, *args, **kwargs):
         return self._run_cmd("replace", key, False, *args, **kwargs)
