@@ -118,6 +118,15 @@ follows:
    ``node3`` is added back into the hasher and will be retried for any future
    operations.
 
+A bare CAS value returned by ``gets`` is only meaningful on the node that
+produced it, but the legacy ``cas`` API must continue hashing the key. For
+route-bound updates, use ``gets_with_cas_token`` and return the resulting
+``CasToken`` to ``cas`` (or ``cas_with_cas_token``). The credential binds the
+key to the originating node, so topology changes cannot silently forward the
+update elsewhere. Temporary failure recovery preserves that node identity;
+calling ``remove_server`` permanently invalidates credentials issued by that
+node, even if the same address is later added back.
+
 Using the built-in retrying mechanism
 -------------------------------------
 The library comes with retry mechanisms that can be used to wrap all kinds of

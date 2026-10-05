@@ -160,8 +160,27 @@ class AWSElastiCacheHashClient(HashClient):
         old_clients = self.clients.copy()
         self.clients.clear()
 
-        for server in self._get_nodes_list():
-            self.add_server(normalize_server_spec(server))
+        servers = [normalize_server_spec(server) for server in self._get_nodes_list()]
+        for server in servers:
+            self.add_server(server, preserve_identity=True)
+
+        for server_key in set(old_clients) - set(self.clients):
+            node_id = self._ensure_node_identity(server_key)
+            self._active_node_ids.discard(node_id)
+            self._dead_node_ids.discard(node_id)
+            self._removed_node_ids.add(node_id)
+            self._failed_clients = {
+                server: metadata
+                for server, metadata in self._failed_clients.items()
+                if self._make_client_key(server) != server_key
+            }
+            self._dead_clients = {
+                server: dead_time
+                for server, dead_time in self._dead_clients.items()
+                if self._make_client_key(server) != server_key
+            }
+            if server_key in self.hasher.nodes:
+                self.hasher.remove_node(server_key)
 
         for client in old_clients.values():
             client.close()

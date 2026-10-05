@@ -43,3 +43,17 @@ class MemcacheUnknownError(MemcacheError):
 class MemcacheUnexpectedCloseError(MemcacheServerError):
     "Raised when the connection with memcached closes unexpectedly."
     pass
+
+
+class MemcacheNodeUnavailableError(MemcacheServerError):
+    """Raised when a route-bound request targets a node that is temporarily
+    unavailable and may later return with the same identity."""
+
+    pass
+
+
+class MemcacheServerRemovedError(MemcacheClientError):
+    """Raised when a route-bound credential was issued by a server that has
+    been permanently removed from the HashClient."""
+
+    pass

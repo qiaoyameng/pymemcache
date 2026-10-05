@@ -2,6 +2,7 @@ Changelog
 =========
 New in version 4.0.0
 --------------------
+* Add opaque, route-bound CAS credentials for ``HashClient``.
 * Dropped Python 2 and 3.6 support
   `#321 <https://github.com/pinterest/pymemcache/pull/321>`_
   `#363 <https://github.com/pinterest/pymemcache/pull/363>`_

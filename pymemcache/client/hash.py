@@ -2,6 +2,7 @@ import collections
 import socket
 import time
 import logging
+import weakref
 
 from pymemcache.client.base import (
     Client,
@@ -10,9 +11,41 @@ from pymemcache.client.base import (
     normalize_server_spec,
 )
 from pymemcache.client.rendezvous import RendezvousHash
-from pymemcache.exceptions import MemcacheError
+from pymemcache.exceptions import (
+    MemcacheError,
+    MemcacheIllegalInputError,
+    MemcacheNodeUnavailableError,
+    MemcacheServerRemovedError,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class CasToken:
+    """An opaque CAS credential bound to a key and a particular node."""
+
+    __slots__ = ("_node_id", "_key", "_cas", "__weakref__")
+
+    def __init__(self):
+        raise TypeError("CasToken objects must be created by a HashClient")
+
+    @classmethod
+    def _create(cls, node_id, key, cas):
+        token = object.__new__(cls)
+        token._node_id = node_id
+        token._key = key
+        token._cas = cas
+        return token
+
+    @property
+    def cas(self):
+        return self._cas
+
+    def __repr__(self):
+        return "CasToken(***)"
+
+
+CasCredential = CasToken
 
 
 class HashClient:
@@ -85,7 +118,7 @@ class HashClient:
         self._failed_clients = {}
         self._dead_clients = {}
         self._last_dead_check_time = time.time()
-
+        self._initialize_node_identity_state()
         self.hasher = hasher()
 
         self.default_kwargs = {
@@ -123,7 +156,63 @@ class HashClient:
             return "%s:%s" % server
         return server
 
-    def add_server(self, server, port=None) -> None:
+    def _initialize_node_identity_state(self):
+        self._next_node_id = 0
+        self._node_ids = {}
+        self._node_keys = {}
+        self._active_node_ids = set()
+        self._dead_node_ids = set()
+        self._removed_node_ids = set()
+        self._cas_tokens = weakref.WeakSet()
+
+    def _add_node_identity(self, server_key):
+        if not hasattr(self, "_node_ids"):
+            self._initialize_node_identity_state()
+
+        old_node_id = self._node_ids.get(server_key)
+
+        node_id = self._next_node_id
+        self._next_node_id += 1
+        self._node_ids[server_key] = node_id
+        self._node_keys[node_id] = server_key
+        if old_node_id is not None:
+            self._active_node_ids.discard(old_node_id)
+            self._dead_node_ids.discard(old_node_id)
+            self._removed_node_ids.add(old_node_id)
+        self._active_node_ids.add(node_id)
+        return node_id
+
+    def _ensure_node_identity(self, server_key):
+        node_id = self._node_ids.get(server_key)
+        if node_id is None:
+            node_id = self._add_node_identity(server_key)
+        return node_id
+
+    def _node_id_for_client(self, client):
+        return self._ensure_node_identity(self._make_client_key(client.server))
+
+    def _mark_node_dead(self, server):
+        server_key = self._make_client_key(server)
+        node_id = self._ensure_node_identity(server_key)
+        if server_key in getattr(self.hasher, "nodes", ()):
+            self.hasher.remove_node(server_key)
+        self._active_node_ids.discard(node_id)
+        self._dead_node_ids.add(node_id)
+
+    def _mark_server_dead(self, server):
+        self._failed_clients.pop(server, None)
+        self._dead_clients[server] = time.time()
+        self._mark_node_dead(server)
+
+    def _restore_dead_node(self, server):
+        server_key = self._make_client_key(server)
+        node_id = self._node_ids[server_key]
+        self.hasher.add_node(server_key)
+        self._dead_node_ids.discard(node_id)
+        self._active_node_ids.add(node_id)
+        return node_id
+
+    def add_server(self, server, port=None, preserve_identity=False) -> None:
         # To maintain backward compatibility, if a port is provided, assume
         # that server wasn't provided as a (host, port) tuple.
         if port is not None:
@@ -137,6 +226,15 @@ class HashClient:
             client.client_class = self.client_class
 
         key = self._make_client_key(server)
+        if not hasattr(self, "_node_ids"):
+            self._initialize_node_identity_state()
+        node_id = self._node_ids.get(key)
+        if preserve_identity and node_id in self._dead_node_ids:
+            self._restore_dead_node(key)
+        elif not preserve_identity or node_id not in self._active_node_ids:
+            self._add_node_identity(key)
+        self._failed_clients.pop(server, None)
+        self._dead_clients.pop(server, None)
         self.clients[key] = client
         self.hasher.add_node(key)
 
@@ -149,10 +247,14 @@ class HashClient:
             server = (server, port)
 
         key = self._make_client_key(server)
-        dead_time = time.time()
-        self._failed_clients.pop(server)
-        self._dead_clients[server] = dead_time
-        self.hasher.remove_node(key)
+        self._failed_clients.pop(server, None)
+        self._dead_clients.pop(server, None)
+        if key in self.hasher.nodes:
+            self.hasher.remove_node(key)
+        node_id = self._ensure_node_identity(key)
+        self._active_node_ids.discard(node_id)
+        self._dead_node_ids.discard(node_id)
+        self._removed_node_ids.add(node_id)
 
     def _retry_dead(self) -> None:
         current_time = time.time()
@@ -165,16 +267,17 @@ class HashClient:
                     candidates.append(server)
             for server in candidates:
                 logger.debug("bringing server back into rotation %s", server)
-                self.add_server(server)
+                self._restore_dead_node(server)
                 del self._dead_clients[server]
             self._last_dead_check_time = current_time
 
-    def _get_client(self, key):
-        # If key is tuple use first item as server key
+    def _split_key(self, key):
         if isinstance(key, tuple) and len(key) == 2:
-            server_key, key = key
-        else:
-            server_key = key
+            return key
+        return key, key
+
+    def _get_client(self, key):
+        server_key, key = self._split_key(key)
 
         check_key_helper(server_key, self.allow_unicode_keys, self.key_prefix)
         if self._dead_clients:
@@ -187,6 +290,7 @@ class HashClient:
                 return None, key
             raise MemcacheError("All servers seem to be down right now")
 
+        self._ensure_node_identity(server)
         return self.clients[server], key
 
     def _safely_run_func(self, client, func, default_val, *args, **kwargs):
@@ -212,7 +316,7 @@ class HashClient:
                     # We've reached our max retry attempts, we need to mark
                     # the sever as dead
                     logger.debug("marking server as dead: %s", client.server)
-                    self.remove_server(client.server)
+                    self._mark_server_dead(client.server)
 
             result = func(*args, **kwargs)
             return result
@@ -265,7 +369,7 @@ class HashClient:
                     # We've reached our max retry attempts, we need to mark
                     # the sever as dead
                     logger.debug("marking server as dead: %s", client.server)
-                    self.remove_server(client.server)
+                    self._mark_server_dead(client.server)
 
             succeeded, failed, err = self._set_many(client, values, *args, **kwargs)
             if err is not None:
@@ -307,7 +411,7 @@ class HashClient:
                 "attempts": 0,
             }
             logger.debug("marking server as dead %s", server)
-            self.remove_server(server)
+            self._mark_server_dead(server)
         # This client has failed previously, we need to update the metadata
         # to reflect that we have attempted it again
         else:
@@ -326,6 +430,50 @@ class HashClient:
         args = list(args)
         args.insert(0, key)
         return self._safely_run_func(client, func, default_val, *args, **kwargs)
+
+    def _make_cas_token(self, client, key, cas):
+        if not hasattr(self, "_cas_tokens"):
+            self._initialize_node_identity_state()
+
+        item_key = self._split_key(key)[1]
+        bound_key = check_key_helper(
+            item_key, self.allow_unicode_keys, self.key_prefix
+        )
+        token = CasToken._create(self._node_id_for_client(client), bound_key, cas)
+        self._cas_tokens.add(token)
+        return token
+
+    def _get_cas_token_client(self, key, token):
+        if not hasattr(self, "_cas_tokens"):
+            self._initialize_node_identity_state()
+
+        if not isinstance(token, CasToken) or token not in self._cas_tokens:
+            raise MemcacheIllegalInputError("Invalid CAS token: %r" % (token,))
+
+        item_key = self._split_key(key)[1]
+        bound_key = check_key_helper(
+            item_key, self.allow_unicode_keys, self.key_prefix
+        )
+        if token._key != bound_key:
+            raise MemcacheIllegalInputError(
+                "CAS token was issued for a different key"
+            )
+
+        if self._dead_clients:
+            self._retry_dead()
+
+        node_id = token._node_id
+        if node_id in self._active_node_ids:
+            return self.clients[self._node_keys[node_id]]
+        if node_id in self._dead_node_ids:
+            raise MemcacheNodeUnavailableError(
+                "CAS token's node is temporarily unavailable"
+            )
+        if node_id in self._removed_node_ids:
+            raise MemcacheServerRemovedError(
+                "CAS token's node has been permanently removed"
+            )
+        raise MemcacheIllegalInputError("Invalid CAS token: %r" % (token,))
 
     def _set_many(self, client, values, *args, **kwargs):
         failed = []
@@ -417,6 +565,28 @@ class HashClient:
     def gets(self, key, *args, **kwargs):
         return self._run_cmd("gets", key, None, *args, **kwargs)
 
+    def gets_with_cas_token(self, key, default=None, cas_default=None):
+        """Fetch a value with an opaque, route-bound CAS credential."""
+        client, item_key = self._get_client(key)
+        if client is None:
+            return default, cas_default
+
+        value, cas = self._safely_run_func(
+            client,
+            client.gets,
+            (default, cas_default),
+            item_key,
+            default=default,
+            cas_default=cas_default,
+        )
+        if cas is cas_default:
+            return value, cas_default
+        return value, self._make_cas_token(client, item_key, cas)
+
+    gets_with_token = gets_with_cas_token
+    gets_with_cas_credential = gets_with_cas_token
+    gets_with_credential = gets_with_cas_token
+
     def gets_many(self, keys, *args, **kwargs):
         return self.get_many(keys, gets=True, *args, **kwargs)
 
@@ -441,8 +611,63 @@ class HashClient:
 
     delete_multi = delete_many
 
-    def cas(self, key, *args, **kwargs):
-        return self._run_cmd("cas", key, False, *args, **kwargs)
+    def cas(
+        self,
+        key,
+        value=None,
+        cas=None,
+        expire=0,
+        noreply=False,
+        flags=None,
+        cas_token=None,
+    ):
+        if cas_token is None and isinstance(cas, CasToken):
+            cas_token = cas
+
+        if cas_token is not None:
+            return self.cas_with_cas_token(
+                key,
+                value,
+                cas_token,
+                expire=expire,
+                noreply=noreply,
+                flags=flags,
+            )
+
+        return self._run_cmd(
+            "cas",
+            key,
+            False,
+            value,
+            cas,
+            expire=expire,
+            noreply=noreply,
+            flags=flags,
+        )
+
+    def cas_with_cas_token(
+        self, key, value, cas_token, expire=0, noreply=False, flags=None
+    ):
+        """Perform CAS using a credential returned by gets_with_cas_token."""
+        item_key = self._split_key(key)[1]
+        client = self._get_cas_token_client(item_key, cas_token)
+        return self._safely_run_func(
+            client,
+            client.cas,
+            False,
+            item_key,
+            value,
+            cas_token.cas,
+            expire=expire,
+            noreply=noreply,
+            flags=flags,
+        )
+
+    cas_with_token = cas_with_cas_token
+    cas_with_cas_credential = cas_with_cas_token
+    cas_with_credential = cas_with_cas_token
+    cas_token = cas_with_cas_token
+    cas_credential = cas_with_cas_token
 
     def replace(self, key, *args, **kwargs):
         return self._run_cmd("replace", key, False, *args, **kwargs)

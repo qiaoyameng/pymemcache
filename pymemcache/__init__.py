@@ -3,6 +3,8 @@ __version__ = "4.0.0"
 from pymemcache.client.base import Client  # noqa
 from pymemcache.client.base import PooledClient  # noqa
 from pymemcache.client.hash import HashClient  # noqa
+from pymemcache.client.hash import CasToken  # noqa
+from pymemcache.client.hash import CasCredential  # noqa
 from pymemcache.client.base import KeepaliveOpts  # noqa
 
 from pymemcache.exceptions import MemcacheError  # noqa
@@ -12,3 +14,5 @@ from pymemcache.exceptions import MemcacheIllegalInputError  # noqa
 from pymemcache.exceptions import MemcacheServerError  # noqa
 from pymemcache.exceptions import MemcacheUnknownError  # noqa
 from pymemcache.exceptions import MemcacheUnexpectedCloseError  # noqa
+from pymemcache.exceptions import MemcacheNodeUnavailableError  # noqa
+from pymemcache.exceptions import MemcacheServerRemovedError  # noqa
