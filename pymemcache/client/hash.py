@@ -23,6 +23,10 @@ class HashClient:
     #: :class:`Client` class used to create new clients
     client_class = Client
 
+    #: Default per-server weights; overridden in ``__init__``. Defined at
+    #: class level so subclasses that skip ``super().__init__`` still work.
+    _server_weights = {}
+
     def __init__(
         self,
         servers,
@@ -48,6 +52,7 @@ class HashClient:
         default_noreply=True,
         encoding="ascii",
         tls_context=None,
+        server_weights=None,
     ):
         """
         Constructor.
@@ -70,6 +75,11 @@ class HashClient:
           dead_timeout (float): Time in seconds before attempting to add a node
                                 back in the pool.
           encoding: optional str, controls data encoding (defaults to 'ascii').
+          server_weights: optional dict mapping ``"host:port"`` server keys
+                          to positive weights. Supplying it enables weighted
+                          rendezvous hashing so that servers receive a share
+                          of keys proportional to their weight. Servers not
+                          listed default to a weight of 1.
 
         Further arguments are interpreted as for :py:class:`.Client`
         constructor.
@@ -86,7 +96,18 @@ class HashClient:
         self._dead_clients = {}
         self._last_dead_check_time = time.time()
 
-        self.hasher = hasher()
+        self._server_weights = dict(server_weights) if server_weights else {}
+
+        if server_weights is not None and isinstance(hasher, type) and issubclass(
+            hasher, RendezvousHash
+        ):
+            self.hasher = hasher(weights={})
+        elif isinstance(hasher, type):
+            self.hasher = hasher()
+        else:
+            # An already-configured hasher instance (e.g. a weighted
+            # RendezvousHash) may be passed directly.
+            self.hasher = hasher
 
         self.default_kwargs = {
             "connect_timeout": connect_timeout,
@@ -138,7 +159,11 @@ class HashClient:
 
         key = self._make_client_key(server)
         self.clients[key] = client
-        self.hasher.add_node(key)
+        weight = self._server_weights.get(key)
+        if weight is None:
+            self.hasher.add_node(key)
+        else:
+            self.hasher.add_node(key, weight=weight)
 
     def remove_server(self, server, port=None) -> None:
         # To maintain backward compatibility, if a port is provided, assume
@@ -150,7 +175,7 @@ class HashClient:
 
         key = self._make_client_key(server)
         dead_time = time.time()
-        self._failed_clients.pop(server)
+        self._failed_clients.pop(server, None)
         self._dead_clients[server] = dead_time
         self.hasher.remove_node(key)
 

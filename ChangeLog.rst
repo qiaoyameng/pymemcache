@@ -1,5 +1,13 @@
 Changelog
 =========
+Unreleased
+----------
+* Added optional weighted mode to ``RendezvousHash`` (positive per-node
+  weights, stable ``get_nodes`` ranking, monotonic key movement) and
+  ``server_weights`` support in ``HashClient``.
+* Added ``pymemcache.client.migration``, an offline tool estimating
+  per-node key movement between two topologies over a key sample.
+
 New in version 4.0.0
 --------------------
 * Dropped Python 2 and 3.6 support
