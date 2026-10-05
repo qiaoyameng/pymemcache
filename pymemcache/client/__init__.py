@@ -4,6 +4,8 @@ from pymemcache.client.base import Client  # noqa
 from pymemcache.client.base import PooledClient  # noqa
 from pymemcache.client.hash import HashClient  # noqa
 from pymemcache.client.retrying import RetryingClient  # noqa
+from pymemcache.client.base import Pipeline  # noqa
+from pymemcache.client.base import PipelineResult  # noqa
 
 from pymemcache.exceptions import MemcacheError  # noqa
 from pymemcache.exceptions import MemcacheClientError  # noqa

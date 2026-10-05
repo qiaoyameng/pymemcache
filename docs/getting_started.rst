@@ -327,6 +327,38 @@ directly:
 This kind of usage is useful for debug sessions or to dig manually into your
 server.
 
+Pipelining
+----------
+
+Independent ``get``, ``set`` and ``delete`` calls can be batched into a single
+write (and a single round trip) with a pipeline:
+
+.. code-block:: python
+
+   from pymemcache.client.base import PipelineResult
+
+   results = (
+       client.pipeline()
+       .get('key1')
+       .set('key2', 'value2', noreply=True)
+       .delete('key3')
+       .execute()
+   )
+
+The returned list keeps the position of every queued command. Replied
+commands hold their normal value (e.g. ``True``/``False`` for a write), while
+silent (``noreply=True``) commands hold ``PipelineResult.SILENT`` instead of
+an ambiguous ``True``. If the connection is lost before the server's responses
+are fully received, every command whose outcome cannot be proven holds
+``PipelineResult.UNKNOWN``; the connection is closed (or, with a pooled
+client, discarded rather than returned to the pool) instead of reporting a
+false success.
+
+A ``version`` command is appended as a read barrier: receiving its reply
+proves the whole batch was processed and pins the response boundary. Keys and
+values are validated and serialized before the batch is written, so an
+illegal argument can never leave earlier writes already on the wire.
+
 Key Constraints
 ---------------
 This client implements the ASCII protocol of memcached. This means keys should not

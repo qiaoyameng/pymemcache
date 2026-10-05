@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import errno
+from enum import Enum
 import platform
 import socket
 from functools import partial
@@ -1356,6 +1357,278 @@ class Client:
     def __delitem__(self, key):
         self.delete(key, noreply=True)
 
+    def pipeline(self) -> "Pipeline":
+        """Create a :class:`Pipeline` that batches commands over this
+        client's connection."""
+        return Pipeline(self)
+
+
+class PipelineResult(Enum):
+    """Outcome of an individual command executed inside a :class:`Pipeline`.
+
+    The members are intentionally distinct from ``True``/``False`` so that a
+    silent (``noreply``) success and an unknown outcome can never be confused
+    with an explicit answer from the server:
+
+    * ``SILENT``: the command was sent with ``noreply`` and the barrier was
+      reached, so the server processed every command up to that point even
+      though no per-command response was returned.
+    * ``UNKNOWN``: the connection was lost (or timed out) before a response
+      boundary proved what happened. The command may have been applied, but it
+      cannot be confirmed either way.
+    """
+
+    SILENT = "silent"
+    UNKNOWN = "unknown"
+
+
+class _QueuedCommand:
+    __slots__ = ("name", "args", "expects_reply")
+
+    def __init__(self, name: bytes, args: tuple, expects_reply: bool) -> None:
+        self.name = name
+        self.args = args
+        self.expects_reply = expects_reply
+
+
+class Pipeline:
+    """Batch independent get/set/delete commands into a single round trip.
+
+    Commands are queued with :meth:`get`, :meth:`set` and :meth:`delete`, and
+    all of them are written to the connection in one write when
+    :meth:`execute` is called. A ``version`` command is appended as a barrier:
+    it produces a single, fixed-shape reply whose receipt proves that the
+    server has finished processing the whole batch and pins the read
+    boundary.
+
+    Results are returned as a list in the exact order in which the commands
+    were queued. Replied commands hold their regular return value, while
+    ``noreply`` (silent) commands hold :attr:`PipelineResult.SILENT`. If the
+    connection drops mid-batch, every command without a proven answer holds
+    :attr:`PipelineResult.UNKNOWN` instead of being silently reported as
+    successful.
+
+    All keys and values are validated and serialized before anything is sent,
+    so an illegal argument never leaves the earlier writes of the batch
+    already on the wire.
+
+    The connection is used exclusively for the duration of :meth:`execute`;
+    when a pooled client is used, the connection is only returned to the pool
+    once the barrier response has been received.
+
+    A pipeline may be reused: calling :meth:`execute` again after a successful
+    run starts a new, empty batch.
+    """
+
+    barrier_cmd = b"version\r\n"
+
+    def __init__(self, client: "Client") -> None:
+        self.client = client
+        self._commands: list[_QueuedCommand] = []
+        self.boundary_confirmed = False
+
+    def get(self, key: Key, default: Optional[Any] = None) -> "Pipeline":
+        """Queue a ``get`` command; its result slot holds the value, or
+        ``default`` when the key is missing."""
+        self._commands.append(_QueuedCommand(b"get", (key, default), True))
+        return self
+
+    def set(
+        self,
+        key: Key,
+        value: Any,
+        expire: int = 0,
+        noreply: bool = False,
+        flags: Optional[int] = None,
+    ) -> "Pipeline":
+        """Queue a ``set`` command.
+
+        With ``noreply=False`` (the default) the result slot is ``True`` on
+        ``STORED`` / ``False`` on ``NOT_STORED``. With ``noreply=True`` it is
+        :attr:`PipelineResult.SILENT` once the barrier confirms the batch.
+        """
+        self._commands.append(
+            _QueuedCommand(
+                b"set", (key, value, expire, flags), not noreply
+            )
+        )
+        return self
+
+    def delete(self, key: Key, noreply: bool = False) -> "Pipeline":
+        """Queue a ``delete`` command; its result slot is ``True`` on
+        ``DELETED`` / ``False`` on ``NOT_FOUND``, or
+        :attr:`PipelineResult.SILENT`` with ``noreply=True``."""
+        self._commands.append(
+            _QueuedCommand(b"delete", (key,), not noreply)
+        )
+        return self
+
+    def _prepare(self) -> tuple[list[bytes], list[_QueuedCommand]]:
+        """Validate and serialize every queued command up front.
+
+        Raises before any socket is touched, so an invalid command can never
+        leave the earlier commands of the batch already written.
+        """
+        client = self.client
+        encoded: list[bytes] = []
+        for command in self._commands:
+            if command.name == b"get":
+                key, default = command.args
+                prefixed_key = client.check_key(key, client.key_prefix)
+                command.args = (key, default, prefixed_key)
+                encoded.append(b"get " + prefixed_key + b"\r\n")
+            elif command.name == b"set":
+                key, data, expire, flags = command.args
+                prefixed_key = client.check_key(key, client.key_prefix)
+                command.args = (key, data, expire, flags, prefixed_key)
+                expire_bytes = client._check_integer(expire, "expire")
+                data, data_flags = client.serde.serialize(prefixed_key, data)
+                if flags is not None:
+                    data_flags = flags
+                if not isinstance(data, bytes):
+                    try:
+                        data = str(data).encode(client.encoding)
+                    except UnicodeEncodeError as e:
+                        raise MemcacheIllegalInputError(
+                            "Data values must be binary-safe: %s" % e
+                        )
+                extra = b" noreply" if not command.expects_reply else b""
+                encoded.append(
+                    b"set "
+                    + prefixed_key
+                    + b" "
+                    + str(data_flags).encode(client.encoding)
+                    + b" "
+                    + expire_bytes
+                    + b" "
+                    + str(len(data)).encode(client.encoding)
+                    + extra
+                    + b"\r\n"
+                    + data
+                    + b"\r\n"
+                )
+            elif command.name == b"delete":
+                (key,) = command.args
+                prefixed_key = client.check_key(key, client.key_prefix)
+                command.args = (key, prefixed_key)
+                extra = b" noreply" if not command.expects_reply else b""
+                encoded.append(b"delete " + prefixed_key + extra + b"\r\n")
+            else:  # pragma: no cover - only the documented commands exist
+                raise MemcacheUnknownCommandError(command.name)
+        return encoded, self._commands
+
+    def _read_reply(
+        self,
+        command: _QueuedCommand,
+        buf: bytes,
+        remapped_keys: dict[bytes, Key],
+    ) -> tuple[Any, bytes]:
+        """Read one command's response from the connection."""
+        client = self.client
+        buf, line = _readline(client.sock, buf)
+        client._raise_errors(line, command.name)
+
+        if command.name == b"get":
+            key, default, prefixed_key = command.args
+            if line == b"END":
+                return default, buf
+            if not line.startswith(b"VALUE"):
+                raise MemcacheUnknownError(line[:32])
+            prefixed_keys = [prefixed_key]
+            original_key, value, buf = client._extract_value(
+                False, line, buf, remapped_keys, prefixed_keys
+            )
+            buf, end_line = _readline(client.sock, buf)
+            client._raise_errors(end_line, command.name)
+            if end_line != b"END":
+                raise MemcacheUnknownError(end_line[:32])
+            return value, buf
+
+        if command.name == b"set":
+            key = command.args[0]
+            if line not in VALID_STORE_RESULTS[b"set"]:
+                raise MemcacheUnknownError(line[:32])
+            return STORE_RESULTS_VALUE[line], buf
+
+        # delete
+        key = command.args[0]
+        if line == b"DELETED":
+            return True, buf
+        if line == b"NOT_FOUND":
+            return False, buf
+        raise MemcacheUnknownError(line[:32])
+
+    def execute(self) -> list[Any]:
+        """Write the whole batch, then read every reply and the barrier.
+
+        Returns a list whose positions match the queued commands.
+        """
+        encoded, commands = self._prepare()
+        # Validation passed and sending is about to start; a reused pipeline
+        # begins a fresh batch even if the run below fails mid-way.
+        self._commands = []
+        return self._run_io(encoded, commands)
+
+    def _run_io(
+        self, encoded: list[bytes], commands: list[_QueuedCommand]
+    ) -> list[Any]:
+        """Send the prepared batch and collect the ordered results."""
+        client = self.client
+        results: list[Any] = [None] * len(commands)
+
+        if client.sock is None:
+            client._connect()
+
+        # ``_prepare`` stashed the prefixed key as the final tuple element.
+        remapped_keys = {
+            command.args[-1]: command.args[0] for command in commands
+        }
+
+        last_confirmed = -1
+        try:
+            client.sock.sendall(b"".join(encoded) + self.barrier_cmd)
+
+            buf = b""
+            for index, command in enumerate(commands):
+                if not command.expects_reply:
+                    continue
+                value, buf = self._read_reply(command, buf, remapped_keys)
+                results[index] = value
+                last_confirmed = index
+
+            # Barrier: the version reply can only arrive once every earlier
+            # command has been fully processed by the server.
+            buf, version_line = _readline(client.sock, buf)
+            client._raise_errors(version_line, b"version")
+            if not version_line.startswith(b"VERSION"):
+                raise MemcacheUnknownError(version_line[:32])
+            last_confirmed = len(commands)
+        except (MemcacheUnexpectedCloseError, OSError):
+            client.close()
+        except Exception:
+            client.close()
+            raise
+        else:
+            self.boundary_confirmed = True
+
+        self._finalize(results, commands, last_confirmed)
+        return results
+
+    @staticmethod
+    def _finalize(
+        results: list[Any], commands: list[_QueuedCommand], last_confirmed: int
+    ) -> None:
+        for index, command in enumerate(commands):
+            if command.expects_reply:
+                if index > last_confirmed:
+                    results[index] = PipelineResult.UNKNOWN
+            elif index < last_confirmed:
+                # A response for a later command proves this noreply command
+                # was already processed by the server.
+                results[index] = PipelineResult.SILENT
+            else:
+                results[index] = PipelineResult.UNKNOWN
+
 
 class PooledClient:
     """A thread-safe pool of clients (with the same client api).
@@ -1662,6 +1935,11 @@ class PooledClient:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.raw_command(command, end_tokens)
 
+    def pipeline(self) -> "_PooledPipeline":
+        """Create a pipeline that holds a single pooled connection for the
+        whole batch (see :class:`Pipeline`)."""
+        return _PooledPipeline(self)
+
     def __setitem__(self, key: Key, value):
         self.set(key, value, noreply=True)
 
@@ -1673,6 +1951,73 @@ class PooledClient:
 
     def __delitem__(self, key):
         self.delete(key, noreply=True)
+
+
+class _PooledPipeline:
+    """A :class:`Pipeline` facade that reserves a pooled connection for the
+    duration of :meth:`execute`.
+
+    Commands are validated and queued without touching the pool. When
+    ``execute`` runs, one connection is borrowed for the whole batch; it is
+    returned to the pool only when the barrier response proved a clean read
+    boundary, and destroyed otherwise.
+    """
+
+    def __init__(self, pooled_client: "PooledClient") -> None:
+        self.pooled_client = pooled_client
+        self._commands: list[_QueuedCommand] = []
+        self.boundary_confirmed = False
+
+    def get(self, key: Key, default: Optional[Any] = None) -> "_PooledPipeline":
+        self._commands.append(_QueuedCommand(b"get", (key, default), True))
+        return self
+
+    def set(
+        self,
+        key: Key,
+        value: Any,
+        expire: int = 0,
+        noreply: bool = False,
+        flags: Optional[int] = None,
+    ) -> "_PooledPipeline":
+        self._commands.append(
+            _QueuedCommand(
+                b"set", (key, value, expire, flags), not noreply
+            )
+        )
+        return self
+
+    def delete(self, key: Key, noreply: bool = False) -> "_PooledPipeline":
+        self._commands.append(
+            _QueuedCommand(b"delete", (key,), not noreply)
+        )
+        return self
+
+    def execute(self) -> list[Any]:
+        pool_obj = self.pooled_client.client_pool
+        client = pool_obj.get()
+        pipeline = Pipeline(client)
+        pipeline._commands = self._commands
+        try:
+            # Up-front validation/serialization happens here, before anything
+            # is written; the still-healthy connection can be released on
+            # failure.
+            encoded, commands = pipeline._prepare()
+        except Exception:
+            pool_obj.release(client)
+            raise
+        try:
+            results = pipeline._run_io(encoded, commands)
+        except Exception:
+            pool_obj.destroy(client)
+            raise
+        if pipeline.boundary_confirmed:
+            pool_obj.release(client)
+        else:
+            pool_obj.destroy(client)
+        self.boundary_confirmed = pipeline.boundary_confirmed
+        self._commands = []
+        return results
 
 
 def _readline(sock: socket.socket, buf: bytes) -> tuple[bytes, bytes]:
