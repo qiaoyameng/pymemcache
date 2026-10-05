@@ -1,5 +1,6 @@
 from pymemcache.client.hash import HashClient
 from pymemcache.client.base import Client, PooledClient
+from pymemcache.client.rendezvous import RendezvousHash
 from pymemcache.exceptions import MemcacheError, MemcacheUnknownError
 from pymemcache import pool
 
@@ -53,6 +54,45 @@ class TestHashClient(ClientTestMixin, unittest.TestCase):
         kwargs = internal_client.call_args[1]
         assert kwargs["timeout"] == 999
         assert kwargs["key_prefix"] == "foo_bar_baz"
+
+    def test_weighted_hasher_kwargs(self):
+        def collide(key, seed):
+            return 1337
+
+        client = HashClient(
+            [("127.0.0.1", 11012), ("127.0.0.1", 11013)],
+            hasher_kwargs={
+                "hash_function": collide,
+                "weights": {"127.0.0.1:11013": 5.0},
+            },
+        )
+        assert client.hasher.weighted
+        for key in (b"alpha", b"beta", b"gamma"):
+            assert client.hasher.get_node(key) == "127.0.0.1:11013"
+
+    def test_add_server_with_weight(self):
+        client = HashClient([])
+        client.add_server(("127.0.0.1", 11012), weight=2.0)
+        client.add_server(("127.0.0.1", 11013))
+        assert client.hasher.weights == {
+            "127.0.0.1:11012": 2.0,
+            "127.0.0.1:11013": 1.0,
+        }
+
+    def test_get_with_weighted_hasher(self):
+        def collide(key, seed):
+            return 1337
+
+        client = self.make_client(
+            [],
+            [b"VALUE key 0 5\r\nvalue\r\nEND\r\n"],
+        )
+        client.hasher = RendezvousHash(
+            ["127.0.0.1:11012", "127.0.0.1:11013"],
+            hash_function=collide,
+            weights={"127.0.0.1:11013": 10.0},
+        )
+        assert client.get(b"key") == b"value"
 
     def test_get_many_unix(self):
         pid = os.getpid()

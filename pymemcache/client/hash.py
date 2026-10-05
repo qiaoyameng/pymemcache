@@ -27,6 +27,7 @@ class HashClient:
         self,
         servers,
         hasher=RendezvousHash,
+        hasher_kwargs=None,
         serde=None,
         serializer=None,
         deserializer=None,
@@ -58,6 +59,10 @@ class HashClient:
           hasher: optional class three functions ``get_node``, ``add_node``,
                   and ``remove_node``
                   defaults to Rendezvous (HRW) hash.
+          hasher_kwargs: optional dict of keyword arguments passed to the
+                         ``hasher`` constructor, e.g.
+                         ``{"weights": {"host:port": 2.0}}`` to enable
+                         weighted rendezvous hashing.
 
           use_pooling: use py:class:`.PooledClient` as the default underlying
                        class. ``max_pool_size`` and ``lock_generator`` can
@@ -86,7 +91,7 @@ class HashClient:
         self._dead_clients = {}
         self._last_dead_check_time = time.time()
 
-        self.hasher = hasher()
+        self.hasher = hasher(**(hasher_kwargs or {}))
 
         self.default_kwargs = {
             "connect_timeout": connect_timeout,
@@ -123,7 +128,7 @@ class HashClient:
             return "%s:%s" % server
         return server
 
-    def add_server(self, server, port=None) -> None:
+    def add_server(self, server, port=None, weight=None) -> None:
         # To maintain backward compatibility, if a port is provided, assume
         # that server wasn't provided as a (host, port) tuple.
         if port is not None:
@@ -138,7 +143,10 @@ class HashClient:
 
         key = self._make_client_key(server)
         self.clients[key] = client
-        self.hasher.add_node(key)
+        if weight is None:
+            self.hasher.add_node(key)
+        else:
+            self.hasher.add_node(key, weight=weight)
 
     def remove_server(self, server, port=None) -> None:
         # To maintain backward compatibility, if a port is provided, assume

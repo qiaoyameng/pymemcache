@@ -85,6 +85,35 @@ used to change how keys are distributed. Changing the hashing algorithm can be
 done by setting the ``hash_function`` argument in the ``RendezvousHash``
 constructor.
 
+Weighted nodes
+^^^^^^^^^^^^^^
+
+When cache nodes have different capacities, ``RendezvousHash`` can assign
+keys proportionally to positive per-node weights. Weighted mode is opt-in:
+pass ``weights`` to the hasher (or ``weight`` to ``add_server``) and nodes
+without an explicit weight default to ``1.0``. Without weights, routing is
+identical to previous versions. Adding a node or raising a node's weight
+only moves keys *to* that node; other nodes never swap keys between
+themselves. ``get_nodes(key)`` returns the full preference ranking, with
+the first entry being the node chosen by ``get_node(key)``.
+
+.. code-block:: python
+
+    client = HashClient(
+        ['cache1:11211', 'cache2:11211'],
+        hasher_kwargs={'weights': {'cache2:11211': 3.0}},
+    )
+    # or later: client.add_server('cache3:11211', weight=2.0)
+
+To estimate how keys would move between two topologies, run the offline
+estimator over a sample of keys (the report describes the sample only, not
+the full key population)::
+
+    python -m pymemcache.client.migration before.json after.json --keys keys.txt
+
+Each topology file is JSON: a list of node names, or an object mapping node
+names to weights.
+
 Rebalancing in the :class:`pymemcache.client.hash.HashClient` functions as
 follows:
 
