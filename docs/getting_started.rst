@@ -327,6 +327,43 @@ directly:
 This kind of usage is useful for debug sessions or to dig manually into your
 server.
 
+Pipelines
+---------
+
+A :class:`pymemcache.pipeline.Pipeline` writes a group of independent
+``get``, ``set`` and ``delete`` commands to a single connection in one round
+trip. Create one with :func:`pymemcache.client.base.Client.pipeline`, queue
+commands on it, and call ``execute`` (or use it as a context manager):
+
+.. code-block:: python
+
+   pipe = client.pipeline()
+   pipe.set(b"counter", b"1", silent=True)
+   pipe.get(b"counter")
+   pipe.delete(b"old-key")
+   results = pipe.execute()
+
+The returned list keeps the position of every queued command, so
+``results[i]`` is the result of the ``i``-th command:
+
+* a get returns the deserialized value or ``None`` on a miss;
+* a set returns ``True`` (``STORED``) or ``False`` (``NOT_STORED``);
+* a delete returns ``True`` (``DELETED``) or ``False`` (``NOT_FOUND``).
+
+Writes queued with ``silent=True`` (alias ``noreply=True``) are sent with
+the memcached ``noreply`` flag and their slot is
+``PipelineResult.SILENT``: the write was flushed but the server never
+acknowledged it. If the connection closes before a reply arrives, the
+affected slots are ``PipelineResult.UNKNOWN`` instead — the operation may
+or may not have happened. Neither sentinel compares equal to ``False``.
+
+All keys and serialized values are validated before any command is
+written, so an illegal argument aborts the whole batch with nothing on
+the wire. The batch holds one connection exclusively while it runs, and a
+trailing ``version`` command acts as a barrier: the connection is returned
+to the pool only once that reply marks a definite response boundary, and
+it is destroyed if the connection was lost.
+
 Key Constraints
 ---------------
 This client implements the ASCII protocol of memcached. This means keys should not

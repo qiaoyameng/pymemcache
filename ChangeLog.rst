@@ -1,5 +1,17 @@
 Changelog
 =========
+New in version 4.1.0
+--------------------
+* Add explicit command pipelining through ``Client.pipeline()``.  A
+  ``Pipeline`` batches ``get``/``set``/``delete`` commands (with optional
+  silent ``noreply`` writes), validates every key and serialized value
+  before sending anything, and uses a ``version`` barrier to establish the
+  response boundary.  Results are returned in submission order with
+  ``PipelineResult.SILENT`` marking unacknowledged writes and
+  ``PipelineResult.UNKNOWN`` marking operations whose fate could not be
+  determined after a disconnect, instead of conflating either with
+  ``False``.
+
 New in version 4.0.0
 --------------------
 * Dropped Python 2 and 3.6 support

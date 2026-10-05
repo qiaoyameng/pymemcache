@@ -465,6 +465,19 @@ class HashClient:
         for client in self.clients.values():
             self._safely_run_func(client, client.flush_all, False, *args, **kwargs)
 
+    def pipeline(self):
+        """Pipelines are not supported by HashClient.
+
+        A pipeline must run on a single connection, but HashClient routes
+        each key to a potentially different node.  Call ``pipeline()`` on
+        the per-node :class:`~pymemcache.client.base.Client` (available
+        through ``hash_client.clients``) instead.
+        """
+        raise NotImplementedError(
+            "HashClient cannot pipeline across multiple nodes; use "
+            "pipeline() on a specific node client instead."
+        )
+
     def quit(self) -> None:
         for client in self.clients.values():
             self._safely_run_func(client, client.quit, False)

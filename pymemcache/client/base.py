@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional, Union
 from collections.abc import Iterable
 
 from pymemcache import pool
+from pymemcache.pipeline import Pipeline, PipelineResult
 from pymemcache.exceptions import (
     MemcacheClientError,
     MemcacheIllegalInputError,
@@ -1069,6 +1070,200 @@ class Client:
         except MemcacheUnexpectedCloseError:
             pass
 
+    def pipeline(self) -> Pipeline:
+        """Create a new :class:`~pymemcache.pipeline.Pipeline`.
+
+        Commands queued on it are sent together on this connection and read
+        back in order when the pipeline is executed::
+
+            pipe = client.pipeline()
+            pipe.set(b"a", b"1", silent=True)
+            pipe.get(b"a")
+            results = pipe.execute()
+        """
+        return Pipeline(self)
+
+    def _pipeline_execute(self, ops: list[tuple]) -> list[Any]:
+        """Validate, send and read one batch of pipelined commands.
+
+        Every queued command is fully built (key checked, value
+        serialized) before the connection is touched, so an illegal
+        argument aborts the batch with nothing on the wire.
+
+        A trailing ``version`` command acts as the response boundary: its
+        single-line reply can only be reached once every reply issued
+        before it has been consumed.  If the connection closes mid-way,
+        replies already read stay confirmed and every remaining slot is
+        marked :attr:`PipelineResult.UNKNOWN`.
+        """
+        # Phase 1: validate and serialize everything up front.
+        commands: list[bytes] = []
+        originals: list[Any] = []
+        expects_reply: list[bool] = []
+        kinds: list[bytes] = []
+
+        for op in ops:
+            kind = op[0]
+            if kind == "get":
+                (_, key) = op
+                prefixed_key = self.check_key(key, self.key_prefix)
+                originals.append(key)
+                expects_reply.append(True)
+                kinds.append(b"get")
+                commands.append(b"get " + prefixed_key + b"\r\n")
+            elif kind == "set":
+                (_, key, data, expire, noreply, flags) = op
+                if noreply is None:
+                    noreply = self.default_noreply
+                prefixed_key = self.check_key(key, self.key_prefix)
+                data, data_flags = self.serde.serialize(prefixed_key, data)
+                if flags is not None:
+                    data_flags = flags
+                if not isinstance(data, bytes):
+                    try:
+                        data = str(data).encode(self.encoding)
+                    except UnicodeEncodeError as e:
+                        raise MemcacheIllegalInputError(
+                            "Data values must be binary-safe: %s" % e
+                        )
+                expire_bytes = self._check_integer(expire, "expire")
+                commands.append(
+                    b"set "
+                    + prefixed_key
+                    + b" "
+                    + str(data_flags).encode(self.encoding)
+                    + b" "
+                    + expire_bytes
+                    + b" "
+                    + str(len(data)).encode(self.encoding)
+                    + (b" noreply" if noreply else b"")
+                    + b"\r\n"
+                    + data
+                    + b"\r\n"
+                )
+                originals.append(None)
+                expects_reply.append(not noreply)
+                kinds.append(b"set")
+            elif kind == "delete":
+                (_, key, noreply) = op
+                if noreply is None:
+                    noreply = self.default_noreply
+                prefixed_key = self.check_key(key, self.key_prefix)
+                commands.append(
+                    b"delete "
+                    + prefixed_key
+                    + (b" noreply" if noreply else b"")
+                    + b"\r\n"
+                )
+                originals.append(None)
+                expects_reply.append(not noreply)
+                kinds.append(b"delete")
+            else:
+                raise MemcacheUnknownCommandError(op[0])
+
+        if not commands:
+            return []
+
+        # The barrier is sent in the same write.  Reading its one-line
+        # reply proves all preceding replies have been fully received.
+        commands.append(b"version\r\n")
+
+        if self.sock is None:
+            self._connect()
+            assert self.sock is not None
+
+        try:
+            self.sock.sendall(b"".join(commands))
+        except Exception:
+            self.close()
+            raise
+
+        results: list[Any] = [
+            PipelineResult.SILENT if not reply else PipelineResult.UNKNOWN
+            for reply in expects_reply
+        ]
+
+        # Phase 2: consume one reply per acknowledged command, stopping at
+        # the barrier.  Positions are kept via the reply index.
+        reply_positions = [i for i, reply in enumerate(expects_reply) if reply]
+        next_reply = 0
+        buf = b""
+        try:
+            while next_reply < len(reply_positions):
+                position = reply_positions[next_reply]
+                kind = kinds[position]
+                try:
+                    buf, line = _readline(self.sock, buf)
+                except MemcacheUnexpectedCloseError:
+                    self.close()
+                    return results
+                self._raise_errors(line, kind)
+
+                if kind == b"get":
+                    if line == b"END":
+                        results[position] = None
+                        next_reply += 1
+                    elif line.startswith(b"VALUE"):
+                        try:
+                            _, _key, data_flags, size = line.split()
+                        except Exception as e:
+                            raise MemcacheUnknownError(
+                                f"Unable to parse line {line!r}: {e}"
+                            )
+                        try:
+                            buf, raw_value = _readvalue(self.sock, buf, int(size))
+                        except MemcacheUnexpectedCloseError:
+                            self.close()
+                            return results
+                        value = self.serde.deserialize(
+                            originals[position], raw_value, int(data_flags)
+                        )
+                        # A single-key get has at most one VALUE, so the
+                        # next line read is END.
+                        try:
+                            buf, line = _readline(self.sock, buf)
+                        except MemcacheUnexpectedCloseError:
+                            self.close()
+                            return results
+                        self._raise_errors(line, b"get")
+                        if line != b"END":
+                            raise MemcacheUnknownError(line[:32])
+                        results[position] = value
+                        next_reply += 1
+                    else:
+                        raise MemcacheUnknownError(line[:32])
+                elif kind == b"set":
+                    if line in VALID_STORE_RESULTS[b"set"]:
+                        results[position] = STORE_RESULTS_VALUE[line]
+                        next_reply += 1
+                    else:
+                        raise MemcacheUnknownError(line[:32])
+                elif kind == b"delete":
+                    if line == b"DELETED":
+                        results[position] = True
+                        next_reply += 1
+                    elif line == b"NOT_FOUND":
+                        results[position] = False
+                        next_reply += 1
+                    else:
+                        raise MemcacheUnknownError(line[:32])
+
+            # Read the barrier reply.  If it never arrives the boundary is
+            # not certain; all reply slots above were confirmed anyway.
+            try:
+                buf, line = _readline(self.sock, buf)
+            except MemcacheUnexpectedCloseError:
+                self.close()
+                return results
+            self._raise_errors(line, b"version")
+            if not line.startswith(b"VERSION"):
+                raise MemcacheUnknownError(line[:32])
+        except Exception:
+            self.close()
+            raise
+
+        return results
+
     def _raise_errors(self, line: bytes, name: bytes) -> None:
         if line.startswith(b"ERROR"):
             raise MemcacheUnknownCommandError(name)
@@ -1658,6 +1853,16 @@ class PooledClient:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             client.shutdown(graceful)
 
+    def pipeline(self) -> Pipeline:
+        """Create a :class:`~pymemcache.pipeline.Pipeline`.
+
+        The batch holds one pooled connection for its whole duration.  The
+        connection is returned to the pool only once the barrier reply has
+        established the response boundary; if the connection closed
+        beforehand it is destroyed instead.
+        """
+        return Pipeline(_PooledPipelineRunner(self))
+
     def raw_command(self, command, end_tokens=b"\r\n"):
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:
             return client.raw_command(command, end_tokens)
@@ -1673,6 +1878,29 @@ class PooledClient:
 
     def __delitem__(self, key):
         self.delete(key, noreply=True)
+
+
+class _PooledPipelineRunner:
+    """Internal adapter that runs a pipeline on a pooled connection."""
+
+    def __init__(self, pooled_client: "PooledClient"):
+        self._pooled_client = pooled_client
+
+    def _pipeline_execute(self, ops: list[tuple]) -> list[Any]:
+        pooled_client = self._pooled_client
+        client = pooled_client.client_pool.get()
+        try:
+            results = client._pipeline_execute(ops)
+        except Exception:
+            pooled_client.client_pool.destroy(client)
+            raise
+        if client.sock is None:
+            # A partial read after an unexpected close: the response
+            # boundary is unknown, never recycle this connection.
+            pooled_client.client_pool.destroy(client)
+        else:
+            pooled_client.client_pool.release(client)
+        return results
 
 
 def _readline(sock: socket.socket, buf: bytes) -> tuple[bytes, bytes]:
