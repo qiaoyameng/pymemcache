@@ -57,6 +57,158 @@ ServerSpec = Union[tuple[str, int], str]
 Key = Union[bytes, str]
 
 
+class MetaGetResult:
+    """
+    The structured result of a memcached "meta get" (``mg``) command, as
+    returned by :py:meth:`Client.meta_get`.
+
+    Attributes:
+      hit: True if the key was found (the server answered ``VA`` or ``HD``),
+        False on a miss (``EN``).
+      value: the raw (not deserialized) value bytes, or None if the key was
+        a miss or if the value was not requested (``return_value=False``).
+      cas: the item's CAS token, if requested with ``return_cas``.
+      ttl: the item's remaining TTL in seconds (-1 means no expiry), if
+        requested with ``return_ttl``.
+      flags: the item's client flags, if requested with ``return_flags``.
+      size: the item's size in bytes, if requested with ``return_size``.
+      last_access: seconds since the item was last accessed, if requested
+        with ``return_last_access``.
+      hit_before: whether the item has been fetched before, if requested
+        with ``return_hit``.
+      opaque: the opaque token echoed back by the server, if one was sent.
+      stale: True if the item is expired but still served from memory (the
+        server sent the ``X`` flag).
+      won_refresh: True if this client won the recache lease (the server
+        sent the ``W`` flag) and should recompute the value.
+      refresh_in_progress: True if another client already holds the recache
+        lease (the server sent the ``Z`` flag).
+      extra_flags: a dict of unknown (extension) flags returned by the
+        server, mapping the flag letter (bytes) to its argument (bytes, or
+        None for flags without an argument).
+    """
+
+    __slots__ = (
+        "hit",
+        "value",
+        "cas",
+        "ttl",
+        "flags",
+        "size",
+        "last_access",
+        "hit_before",
+        "opaque",
+        "stale",
+        "won_refresh",
+        "refresh_in_progress",
+        "extra_flags",
+    )
+
+    def __init__(
+        self,
+        *,
+        hit: bool,
+        value: Optional[bytes] = None,
+        cas: Optional[int] = None,
+        ttl: Optional[int] = None,
+        flags: Optional[int] = None,
+        size: Optional[int] = None,
+        last_access: Optional[int] = None,
+        hit_before: Optional[bool] = None,
+        opaque: Optional[bytes] = None,
+        stale: bool = False,
+        won_refresh: bool = False,
+        refresh_in_progress: bool = False,
+        extra_flags: Optional[dict[bytes, Optional[bytes]]] = None,
+    ):
+        self.hit = hit
+        self.value = value
+        self.cas = cas
+        self.ttl = ttl
+        self.flags = flags
+        self.size = size
+        self.last_access = last_access
+        self.hit_before = hit_before
+        self.opaque = opaque
+        self.stale = stale
+        self.won_refresh = won_refresh
+        self.refresh_in_progress = refresh_in_progress
+        self.extra_flags = extra_flags if extra_flags is not None else {}
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, MetaGetResult):
+            return NotImplemented
+        return all(
+            getattr(self, name) == getattr(other, name) for name in self.__slots__
+        )
+
+    def __repr__(self) -> str:
+        attrs = ", ".join(
+            f"{name}={getattr(self, name)!r}" for name in self.__slots__
+        )
+        return f"{type(self).__name__}({attrs})"
+
+
+def _parse_meta_int(flag: bytes, arg: bytes) -> int:
+    try:
+        return int(arg)
+    except ValueError:
+        raise MemcacheUnknownError(
+            f"Malformed meta flag {flag!r}: expected an integer, got {arg!r}"
+        )
+
+
+def _parse_meta_get_flags(flag_tokens: list[bytes]) -> MetaGetResult:
+    """Parse the flag tokens of a meta get response line into a result.
+
+    Unknown (extension) flags that are well-formed (a letter followed by an
+    optional argument) are preserved in ``extra_flags``. Malformed tokens
+    raise a protocol error.
+    """
+    result = MetaGetResult(hit=False)
+    for token in flag_tokens:
+        if not token:
+            raise MemcacheUnknownError("Malformed meta response: empty flag token")
+        flag, arg = token[:1], token[1:]
+        if not (b"a" <= flag <= b"z" or b"A" <= flag <= b"Z"):
+            raise MemcacheUnknownError(
+                f"Malformed meta response: bad flag token {token!r}"
+            )
+        if flag == b"f":
+            result.flags = _parse_meta_int(flag, arg)
+        elif flag == b"c":
+            result.cas = _parse_meta_int(flag, arg)
+        elif flag == b"t":
+            result.ttl = _parse_meta_int(flag, arg)
+        elif flag == b"s":
+            result.size = _parse_meta_int(flag, arg)
+        elif flag == b"l":
+            result.last_access = _parse_meta_int(flag, arg)
+        elif flag == b"h":
+            if arg not in (b"0", b"1"):
+                raise MemcacheUnknownError(
+                    f"Malformed meta flag {flag!r}: expected 0 or 1, got {arg!r}"
+                )
+            result.hit_before = arg == b"1"
+        elif flag == b"O":
+            result.opaque = arg
+        elif flag in (b"W", b"X", b"Z"):
+            if arg:
+                raise MemcacheUnknownError(
+                    f"Malformed meta flag {flag!r}: unexpected argument {arg!r}"
+                )
+            if flag == b"W":
+                result.won_refresh = True
+            elif flag == b"X":
+                result.stale = True
+            else:
+                result.refresh_in_progress = True
+        else:
+            # Unknown but well-formed extension flag: preserve it.
+            result.extra_flags[flag] = arg if arg else None
+    return result
+
+
 # Some of the values returned by the "stats" command
 # need mapping into native Python types
 def _parse_bool_int(value: bytes) -> bool:
@@ -784,6 +936,140 @@ class Client:
 
         return self._fetch_cmd(b"gets", keys, True, key_prefix=self.key_prefix)
 
+    def meta_get(
+        self,
+        key: Key,
+        return_value: bool = True,
+        return_cas: bool = False,
+        return_ttl: bool = False,
+        return_flags: bool = False,
+        return_size: bool = False,
+        return_last_access: bool = False,
+        return_hit: bool = False,
+        opaque: Optional[Union[str, bytes]] = None,
+        recache_ttl: Optional[int] = None,
+        vivify_ttl: Optional[int] = None,
+    ) -> MetaGetResult:
+        """
+        The memcached "meta get" ("mg") command for one key.
+
+        Besides plain retrieval, this command can be used to protect against
+        cache stampedes ("cache breakdown") with a server-side recache lease,
+        avoiding a client-side distributed lock: pass ``recache_ttl`` and,
+        when the item's remaining TTL drops below that threshold, exactly one
+        client wins the right to refresh the value (``result.won_refresh``)
+        while the others keep using the current (possibly ``result.stale``)
+        value. Note that this method only reports whether the lease was won;
+        it does not run any refresh function itself.
+
+        Args:
+          key: str, see class docs for details.
+          return_value: optional bool, True to return the item's value
+                        (the default). When False, only metadata is returned.
+          return_cas: optional bool, True to return the item's CAS token.
+          return_ttl: optional bool, True to return the item's remaining TTL
+                      in seconds (-1 means no expiry).
+          return_flags: optional bool, True to return the item's client flags.
+          return_size: optional bool, True to return the item's size in bytes.
+          return_last_access: optional bool, True to return the number of
+                              seconds since the item was last accessed.
+          return_hit: optional bool, True to return whether the item has been
+                      fetched before.
+          opaque: optional str or bytes, an opaque token that the server echoes
+                  back in the response (result.opaque). Must be ASCII and
+                  contain no whitespace.
+          recache_ttl: optional int, ask the server for the recache lease if
+                       the item's remaining TTL is below this many seconds
+                       (the "R" flag). Mutually exclusive with vivify_ttl.
+          vivify_ttl: optional int, ask the server to create a locked
+                      placeholder item with this TTL on a miss, granting the
+                      recache lease to the first client that misses
+                      (the "N" flag). Mutually exclusive with recache_ttl.
+
+        Returns:
+          A :py:class:`MetaGetResult` with the hit/miss status, the raw value
+          bytes (not deserialized), the requested metadata, whether the item
+          is stale, whether the recache lease was won, and any unknown
+          extension flags returned by the server.
+
+        Raises:
+          MemcacheIllegalInputError: if mutually exclusive or otherwise
+            invalid arguments are given.
+          MemcacheUnknownError: if the server returns a response that cannot
+            be parsed.
+        """
+        if recache_ttl is not None and vivify_ttl is not None:
+            raise MemcacheIllegalInputError(
+                "recache_ttl and vivify_ttl are mutually exclusive"
+            )
+
+        cmd = b"mg " + self.check_key(key, self.key_prefix)
+        if return_value:
+            cmd += b" v"
+        if return_cas:
+            cmd += b" c"
+        if return_ttl:
+            cmd += b" t"
+        if return_flags:
+            cmd += b" f"
+        if return_size:
+            cmd += b" s"
+        if return_last_access:
+            cmd += b" l"
+        if return_hit:
+            cmd += b" h"
+        if opaque is not None:
+            cmd += b" O" + self._check_opaque(opaque)
+        if recache_ttl is not None:
+            cmd += b" R" + self._check_integer(recache_ttl, "recache_ttl")
+        if vivify_ttl is not None:
+            cmd += b" N" + self._check_integer(vivify_ttl, "vivify_ttl")
+        cmd += b"\r\n"
+
+        if self.sock is None:
+            self._connect()
+
+            # For typing
+            assert self.sock is not None
+
+        try:
+            self.sock.sendall(cmd)
+
+            buf, line = _readline(self.sock, b"")
+            self._raise_errors(line, b"mg")
+
+            parts = line.split(b" ")
+            code = parts[0]
+            value = None
+            if code == b"VA":
+                if len(parts) < 2 or not parts[1].isdigit():
+                    raise MemcacheUnknownError(
+                        f"Received malformed meta response: {line[:32]!r}"
+                    )
+                # The value is read by its declared length, so embedded
+                # newlines or "END" sequences cannot terminate it early.
+                buf, value = _readvalue(self.sock, buf, int(parts[1]))
+                flag_tokens = parts[2:]
+                hit = True
+            elif code == b"HD":
+                flag_tokens = parts[1:]
+                hit = True
+            elif code == b"EN":
+                flag_tokens = parts[1:]
+                hit = False
+            else:
+                raise MemcacheUnknownError(
+                    f"Received unexpected meta response: {line[:32]!r}"
+                )
+
+            result = _parse_meta_get_flags(flag_tokens)
+            result.hit = hit
+            result.value = value
+            return result
+        except Exception:
+            self.close()
+            raise
+
     def delete(self, key: Key, noreply: Optional[bool] = None) -> bool:
         """
         The memcached "delete" command.
@@ -1113,6 +1399,30 @@ class Client:
             )
 
         return cas
+
+    def _check_opaque(self, opaque: Union[str, bytes]) -> bytes:
+        """Check that a value is a valid opaque token for meta commands --
+        a non-empty str or bytes value without whitespace."""
+        if isinstance(opaque, str):
+            try:
+                opaque = opaque.encode(self.encoding)
+            except UnicodeEncodeError:
+                raise MemcacheIllegalInputError(
+                    "non-ASCII opaque token: %r" % opaque
+                )
+        elif not isinstance(opaque, bytes):
+            raise MemcacheIllegalInputError(
+                "opaque must be string or bytes, got bad value: %r" % opaque
+            )
+
+        if not opaque:
+            raise MemcacheIllegalInputError("opaque token must not be empty")
+        if len(opaque.split()) > 1 or opaque.split()[0] != opaque:
+            raise MemcacheIllegalInputError(
+                "opaque token contains whitespace: %r" % opaque
+            )
+
+        return opaque
 
     def _extract_value(
         self,
@@ -1595,6 +1905,35 @@ class PooledClient:
                     return {}
                 else:
                     raise
+
+    def meta_get(
+        self,
+        key: Key,
+        return_value: bool = True,
+        return_cas: bool = False,
+        return_ttl: bool = False,
+        return_flags: bool = False,
+        return_size: bool = False,
+        return_last_access: bool = False,
+        return_hit: bool = False,
+        opaque: Optional[Union[str, bytes]] = None,
+        recache_ttl: Optional[int] = None,
+        vivify_ttl: Optional[int] = None,
+    ) -> MetaGetResult:
+        with self.client_pool.get_and_release(destroy_on_fail=True) as client:
+            return client.meta_get(
+                key,
+                return_value=return_value,
+                return_cas=return_cas,
+                return_ttl=return_ttl,
+                return_flags=return_flags,
+                return_size=return_size,
+                return_last_access=return_last_access,
+                return_hit=return_hit,
+                opaque=opaque,
+                recache_ttl=recache_ttl,
+                vivify_ttl=vivify_ttl,
+            )
 
     def delete(self, key: Key, noreply: Optional[bool] = None) -> bool:
         with self.client_pool.get_and_release(destroy_on_fail=True) as client:

@@ -8,6 +8,10 @@ New in version 4.0.0
 * Begin adding typing
 * Add pluggable compression serde
   `#407 <https://github.com/pinterest/pymemcache/pull/407>`_
+* Add ``Client.meta_get`` (and ``PooledClient.meta_get``) implementing the
+  memcached meta get (``mg``) command, returning a structured
+  ``MetaGetResult`` with hit/miss, staleness and recache-lease (``W``/``Z``)
+  status for cache-stampede protection without client-side locks.
 
 
 New in version 3.5.2

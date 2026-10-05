@@ -28,6 +28,7 @@ import pytest
 from pymemcache.client.base import (
     PooledClient,
     Client,
+    MetaGetResult,
     normalize_server_spec,
     KeepaliveOpts,
     check_key_helper,
@@ -1218,6 +1219,175 @@ class TestClient(ClientTestMixin, unittest.TestCase):
         assert client.raw_command(b"key", b"\r\n") == b"REPLY"
         assert client.raw_command("key", "\r\n") == b"REPLY"
         assert client.raw_command(b"key", b"\r\n") == b"REPLY"
+
+
+@pytest.mark.unit()
+class TestMetaGet(unittest.TestCase):
+    def make_client(self, mock_socket_values, **kwargs):
+        client = Client("localhost", **kwargs)
+        sock = MockSocket(list(mock_socket_values))
+        client._connect = mock.Mock(
+            side_effect=functools.partial(setattr, client, "sock", sock)
+        )
+        return client
+
+    def make_pooled_client(self, mock_socket_values, **kwargs):
+        mock_client = Client("localhost", **kwargs)
+        mock_client.sock = MockSocket(list(mock_socket_values))
+        client = PooledClient("localhost", **kwargs)
+        client.client_pool = pool.ObjectPool(lambda: mock_client)
+        return client, mock_client
+
+    def test_hit_with_value_and_metadata(self):
+        client = self.make_client([b"VA 5 f7 t30 c99 Oabc\r\nvalue\r\n"])
+        result = client.meta_get(
+            b"key",
+            return_cas=True,
+            return_ttl=True,
+            return_flags=True,
+            opaque=b"abc",
+        )
+        assert client.sock.send_bufs == [b"mg key v c t f Oabc\r\n"]
+        assert result == MetaGetResult(
+            hit=True, value=b"value", cas=99, ttl=30, flags=7, opaque=b"abc"
+        )
+
+    def test_hit_with_binary_value(self):
+        # Embedded newlines and "END" sequences must not terminate the
+        # value early: exactly the declared number of bytes is read.
+        value = b"a\r\nEND\nb"
+        client = self.make_client([b"VA 8\r\n" + value + b"\r\n"])
+        result = client.meta_get(b"key")
+        assert result.hit is True
+        assert result.value == value
+
+    def test_hit_with_binary_value_split_chunks(self):
+        # Same as above, but the response arrives in chunks that split
+        # both the header and the value's "\r\n" sequences.
+        value = b"a\r\nEND\nb"
+        client = self.make_client([b"VA 8\r\na\r", b"\nEND\nb\r\n"])
+        result = client.meta_get(b"key")
+        assert result.hit is True
+        assert result.value == value
+
+    def test_miss(self):
+        client = self.make_client([b"EN\r\n"])
+        result = client.meta_get(b"key")
+        assert client.sock.send_bufs == [b"mg key v\r\n"]
+        assert result == MetaGetResult(hit=False)
+
+    def test_miss_with_opaque_echo(self):
+        client = self.make_client([b"EN Otok\r\n"])
+        result = client.meta_get(b"key", opaque="tok")
+        assert client.sock.send_bufs == [b"mg key v Otok\r\n"]
+        assert result.hit is False
+        assert result.opaque == b"tok"
+
+    def test_meta_only_response(self):
+        client = self.make_client([b"HD t30 c5 h1 s10 l42\r\n"])
+        result = client.meta_get(
+            b"key",
+            return_value=False,
+            return_cas=True,
+            return_ttl=True,
+            return_size=True,
+            return_last_access=True,
+            return_hit=True,
+        )
+        assert client.sock.send_bufs == [b"mg key c t s l h\r\n"]
+        assert result == MetaGetResult(
+            hit=True, cas=5, ttl=30, size=10, last_access=42, hit_before=True
+        )
+
+    def test_recache_winner(self):
+        client = self.make_client([b"VA 5 t5 W X\r\nvalue\r\n"])
+        result = client.meta_get(b"key", return_ttl=True, recache_ttl=30)
+        assert client.sock.send_bufs == [b"mg key v t R30\r\n"]
+        assert result.hit is True
+        assert result.value == b"value"
+        assert result.won_refresh is True
+        assert result.refresh_in_progress is False
+        assert result.stale is True
+
+    def test_recache_loser(self):
+        client = self.make_client([b"VA 5 t5 Z\r\nvalue\r\n"])
+        result = client.meta_get(b"key", return_ttl=True, recache_ttl=30)
+        assert result.hit is True
+        assert result.won_refresh is False
+        assert result.refresh_in_progress is True
+        assert result.stale is False
+
+    def test_vivify_on_miss(self):
+        client = self.make_client([b"EN W\r\n"])
+        result = client.meta_get(b"key", vivify_ttl=30)
+        assert client.sock.send_bufs == [b"mg key v N30\r\n"]
+        assert result.hit is False
+        assert result.won_refresh is True
+
+    def test_unknown_flags_preserved(self):
+        client = self.make_client([b"HD t30 Qabc J\r\n"])
+        result = client.meta_get(b"key", return_value=False, return_ttl=True)
+        assert result.hit is True
+        assert result.ttl == 30
+        assert result.extra_flags == {b"Q": b"abc", b"J": None}
+
+    def test_mutually_exclusive_options(self):
+        client = self.make_client([])
+        with pytest.raises(MemcacheIllegalInputError):
+            client.meta_get(b"key", recache_ttl=30, vivify_ttl=30)
+
+    def test_invalid_opaque(self):
+        client = self.make_client([])
+        with pytest.raises(MemcacheIllegalInputError):
+            client.meta_get(b"key", opaque=b"has space")
+        with pytest.raises(MemcacheIllegalInputError):
+            client.meta_get(b"key", opaque=b"")
+        with pytest.raises(MemcacheIllegalInputError):
+            client.meta_get(b"key", opaque=1)
+
+    def test_bad_response_code(self):
+        client = self.make_client([b"WAT\r\n"])
+        with pytest.raises(MemcacheUnknownError):
+            client.meta_get(b"key")
+        assert client.sock is None
+
+    def test_bad_response_size(self):
+        client = self.make_client([b"VA x\r\n"])
+        with pytest.raises(MemcacheUnknownError):
+            client.meta_get(b"key")
+        assert client.sock is None
+
+    def test_bad_response_flag(self):
+        client = self.make_client([b"HD tnotanumber\r\n"])
+        with pytest.raises(MemcacheUnknownError):
+            client.meta_get(b"key", return_value=False, return_ttl=True)
+        assert client.sock is None
+
+    def test_truncated_value(self):
+        client = self.make_client([b"VA 10\r\nval", b""])
+        with pytest.raises(MemcacheUnexpectedCloseError):
+            client.meta_get(b"key")
+        # The connection must be closed so it cannot be reused as clean.
+        assert client.sock is None
+
+    def test_pooled_hit(self):
+        client, _ = self.make_pooled_client([b"VA 5 t30\r\nvalue\r\n"])
+        result = client.meta_get(b"key", return_ttl=True)
+        assert result.hit is True
+        assert result.value == b"value"
+        assert result.ttl == 30
+        # A clean client is returned to the pool for reuse.
+        assert len(client.client_pool.free) == 1
+
+    def test_pooled_connection_error_destroys_client(self):
+        client, mock_client = self.make_pooled_client([b"VA 10\r\nval", b""])
+        with pytest.raises(MemcacheUnexpectedCloseError):
+            client.meta_get(b"key")
+        # The failed client must be destroyed, not returned to the pool
+        # as a clean connection.
+        assert client.client_pool.free == ()
+        assert client.client_pool.used == ()
+        assert mock_client.sock is None
 
 
 @pytest.mark.unit()
