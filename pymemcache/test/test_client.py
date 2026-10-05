@@ -34,6 +34,7 @@ from pymemcache.client.base import (
 )
 from pymemcache.exceptions import (
     MemcacheClientError,
+    MemcacheProtocolError,
     MemcacheServerError,
     MemcacheUnexpectedCloseError,
     MemcacheUnknownCommandError,
@@ -1476,6 +1477,166 @@ class TestPooledClient(ClientTestMixin, unittest.TestCase):
         client = self.make_client([b"NOT_FOUND\r\n"], encoding="utf-8")
         result = client.cas(b"key", b"value", b"123", noreply=False)
         assert result is None
+
+
+@pytest.mark.unit()
+class TestMetaGet:
+    def make_client(self, mock_socket_values, **kwargs):
+        client = Client("localhost", **kwargs)
+        sock = MockSocket(list(mock_socket_values))
+        client._connect = mock.Mock(
+            side_effect=functools.partial(setattr, client, "sock", sock)
+        )
+        return client
+
+    def test_hit(self):
+        client = self.make_client([b"VA 5 f0 c123 t30\r\nvalue\r\n"])
+        result = client.meta_get(b"key", return_cas=True, return_ttl=True)
+        assert result.hit is True
+        assert result.value == b"value"
+        assert result.cas == 123
+        assert result.ttl == 30
+        assert result.stale is False
+        assert result.won_recache is False
+        assert client.sock.send_bufs == [b"mg key f v c t\r\n"]
+
+    def test_miss(self):
+        client = self.make_client([b"EN\r\n"])
+        result = client.meta_get(b"key")
+        assert result.hit is False
+        assert result.value is None
+        assert result.cas is None
+
+    def test_meta_only_response(self):
+        client = self.make_client([b"HD f0 c7 t42\r\n"])
+        result = client.meta_get(
+            b"key", return_value=False, return_cas=True, return_ttl=True
+        )
+        assert result.hit is True
+        assert result.value is None
+        assert result.cas == 7
+        assert result.ttl == 42
+        assert client.sock.send_bufs == [b"mg key f c t\r\n"]
+
+    def test_recache_winner(self):
+        client = self.make_client([b"VA 3 f0 c9 t5 W\r\nfoo\r\n"])
+        result = client.meta_get(
+            b"key", return_cas=True, return_ttl=True, recache_ttl=30
+        )
+        assert result.hit is True
+        assert result.value == b"foo"
+        assert result.won_recache is True
+        assert result.stale is False
+        assert client.sock.send_bufs == [b"mg key f v c t R30\r\n"]
+
+    def test_recache_loser(self):
+        client = self.make_client([b"HD f0 c9 t5 Z\r\n"])
+        result = client.meta_get(
+            b"key",
+            return_value=False,
+            return_cas=True,
+            return_ttl=True,
+            recache_ttl=30,
+        )
+        assert result.hit is True
+        assert result.won_recache is False
+        assert result.flags[b"Z"] is True
+
+    def test_lease_winner_on_miss(self):
+        client = self.make_client([b"VA 0 f0 c1 t30 W\r\n\r\n"])
+        result = client.meta_get(
+            b"key", return_cas=True, return_ttl=True, lease_ttl=30
+        )
+        assert result.hit is True
+        assert result.value == b""
+        assert result.won_recache is True
+        assert client.sock.send_bufs == [b"mg key f v c t N30\r\n"]
+
+    def test_stale_hit(self):
+        client = self.make_client([b"VA 3 f0 X\r\nfoo\r\n"])
+        result = client.meta_get(b"key")
+        assert result.hit is True
+        assert result.stale is True
+        assert result.won_recache is False
+
+    def test_opaque(self):
+        client = self.make_client([b"VA 2 f0 Otoken123\r\nhi\r\n"])
+        result = client.meta_get(b"key", opaque=b"token123")
+        assert result.opaque == b"token123"
+        assert client.sock.send_bufs == [b"mg key f v Otoken123\r\n"]
+
+    def test_binary_value_with_crlf_and_end(self):
+        payload = b"a\r\nEND\r\nb"
+        client = self.make_client([b"VA 9 f0\r\n" + payload + b"\r\n"])
+        result = client.meta_get(b"key")
+        assert result.value == payload
+
+    def test_unknown_flags_preserved(self):
+        client = self.make_client([b"VA 2 f0 Q99 z\r\nhi\r\n"])
+        result = client.meta_get(b"key")
+        assert result.flags[b"Q"] == b"99"
+        assert result.flags[b"z"] is True
+
+    def test_mutually_exclusive_recache_and_lease(self):
+        client = self.make_client([])
+        with pytest.raises(MemcacheProtocolError):
+            client.meta_get(b"key", recache_ttl=10, lease_ttl=10)
+
+    def test_bad_response_status(self):
+        client = self.make_client([b"GARBAGE\r\n"])
+        with pytest.raises(MemcacheProtocolError):
+            client.meta_get(b"key")
+        assert client.sock is None
+
+    def test_malformed_flag(self):
+        client = self.make_client([b"VA 2 f0 cX\r\nhi\r\n"])
+        with pytest.raises(MemcacheProtocolError):
+            client.meta_get(b"key")
+        assert client.sock is None
+
+    def test_truncated_value(self):
+        client = self.make_client([b"VA 10 f0\r\nsh", b""])
+        with pytest.raises(MemcacheUnexpectedCloseError):
+            client.meta_get(b"key")
+        assert client.sock is None
+
+    def test_bad_opaque(self):
+        client = self.make_client([])
+        with pytest.raises(MemcacheIllegalInputError):
+            client.meta_get(b"key", opaque=b"has space")
+
+
+@pytest.mark.unit()
+class TestPooledClientMetaGet:
+    def make_client(self, mock_client):
+        client = PooledClient("localhost")
+        client.client_pool = pool.ObjectPool(lambda: mock_client)
+        return client
+
+    def test_meta_get_through_pool(self):
+        mock_client = Client("localhost")
+        mock_client.sock = MockSocket([b"VA 2 f0\r\nhi\r\n"])
+        client = self.make_client(mock_client)
+        result = client.meta_get(b"key")
+        assert result.hit is True
+        assert result.value == b"hi"
+        # A clean connection is returned to the pool for reuse.
+        assert client.client_pool.free == (mock_client,)
+
+    def test_connection_error_client_not_reused(self):
+        broken_client = Client("localhost")
+        broken_client.sock = MockSocket([b"VA 10 f0\r\nsh", b""])
+        destroyed = []
+        client = self.make_client(broken_client)
+        client.client_pool._after_remove = destroyed.append
+        with pytest.raises(MemcacheUnexpectedCloseError):
+            client.meta_get(b"key")
+        # The broken connection is closed and destroyed instead of being
+        # returned to the pool as a clean connection.
+        assert broken_client.sock is None
+        assert destroyed == [broken_client]
+        assert client.client_pool.free == ()
+        assert client.client_pool.used == ()
 
 
 class TestPooledClientIdleTimeout(ClientTestMixin, unittest.TestCase):

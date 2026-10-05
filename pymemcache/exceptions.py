@@ -40,6 +40,14 @@ class MemcacheUnknownError(MemcacheError):
     pass
 
 
+class MemcacheProtocolError(MemcacheError):
+    """Raised when a meta protocol command is misused (for example, when
+    mutually exclusive options are combined) or when memcached returns a
+    meta protocol response that cannot be parsed."""
+
+    pass
+
+
 class MemcacheUnexpectedCloseError(MemcacheServerError):
     "Raised when the connection with memcached closes unexpectedly."
     pass
